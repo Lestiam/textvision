@@ -12,7 +12,7 @@ import os
 import queue
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
@@ -394,6 +394,11 @@ class TTSEngine:
         self._available: bool | None = None
         self._error: str | None = None
         self._stop_flag = threading.Event()
+        self._speaking_event = threading.Event()
+
+    @property
+    def is_speaking(self) -> bool:
+        return self._speaking_event.is_set()
 
     def _ensure(self) -> bool:
         if self._available is not None:
@@ -418,6 +423,7 @@ class TTSEngine:
             item = self._queue.get()
             if item is None:
                 return
+            self._speaking_event.set()
             try:
                 engine = pyttsx3.init()
                 engine.setProperty("rate", self.rate)
@@ -426,6 +432,8 @@ class TTSEngine:
                 engine.stop()
             except Exception as exc:
                 self._error = str(exc)
+            finally:
+                self._speaking_event.clear()
 
     def speak(self, text: str) -> bool:
         text = (text or "").strip()

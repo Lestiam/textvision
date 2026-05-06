@@ -26,6 +26,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageTk
 
+from blip_engine import BLIPEngine, BLIPDescribeResult
 from ocr_engine import OCREngine, OCRResult, TTSEngine
 from screen_capture import CursorMagnifier, RegionSelector, Region, ScreenStream
 from vision import (
@@ -162,6 +163,15 @@ class TextVisionApp:
         self._photo_ref: ImageTk.PhotoImage | None = None
         self._photo_size: tuple[int, int] = (0, 0)
         self._ocr_running = False
+        self._screen_indicator: tk.Toplevel | None = None
+        self._tts_loading: bool = False
+        self._tts_spinner_frame: int = 0
+        self._tts_speak_start: float = 0.0
+        self.blip = BLIPEngine()
+        self._describe_mode: str | None = None  # "camera" quando ativo
+        self._describe_loading: bool = False
+        self._describe_spinner_frame: int = 0
+        self._describe_start_time: float = 0.0
 
         # Fontes
         self.camera = CameraStream(CAMERA_INDEX)
@@ -257,10 +267,31 @@ class TextVisionApp:
         body = tk.Frame(self.root, bg=C_BG)
         body.pack(fill=tk.BOTH, expand=True, padx=28)
 
-        sidebar = tk.Frame(body, bg=C_BG, width=270)
-        sidebar.pack(side=tk.RIGHT, fill=tk.Y, padx=(24, 0))
-        sidebar.pack_propagate(False)
+        sidebar_outer = tk.Frame(body, bg=C_BG, width=270)
+        sidebar_outer.pack(side=tk.RIGHT, fill=tk.Y, padx=(24, 0))
+        sidebar_outer.pack_propagate(False)
+
+        self._sidebar_canvas = tk.Canvas(
+            sidebar_outer, bg=C_BG, bd=0, highlightthickness=0,
+        )
+        _sb_scroll = ttk.Scrollbar(
+            sidebar_outer, orient=tk.VERTICAL,
+            command=self._sidebar_canvas.yview,
+        )
+        _sb_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self._sidebar_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._sidebar_canvas.configure(yscrollcommand=_sb_scroll.set)
+
+        sidebar = tk.Frame(self._sidebar_canvas, bg=C_BG)
+        _wid = self._sidebar_canvas.create_window((0, 0), window=sidebar, anchor="nw")
+        sidebar.bind("<Configure>", lambda e: self._sidebar_canvas.configure(
+            scrollregion=self._sidebar_canvas.bbox("all")
+        ))
+        self._sidebar_canvas.bind("<Configure>", lambda e:
+            self._sidebar_canvas.itemconfig(_wid, width=e.width)
+        )
         self._build_sidebar(sidebar)
+        self._bind_sidebar_scroll(sidebar)
 
         video_wrap = tk.Frame(
             body, bg=C_SURFACE,
@@ -287,6 +318,10 @@ class TextVisionApp:
         self._action_row(parent, "Lupa do cursor",    "M", self._toggle_magnifier)
 
         self._divider(parent)
+
+        # ---- Atalhos ----
+        self._action_row(parent, "Atalhos", "?", self._show_shortcuts)
+        self._spacer(parent, 8)
 
         # ---- Sliders ----
         self.zoom_var = tk.DoubleVar(value=self.settings.zoom)
@@ -333,7 +368,8 @@ class TextVisionApp:
         self._lang_btn = self._button_pill(parent, self.lang_var, self._cycle_language)
         self._spacer(parent, 6)
         self._action_row(parent, "Reconhecer texto", "O", self._do_ocr)
-        self._action_row(parent, "Ler em voz alta",  "L", self._do_speak)
+        self._build_tts_action_row(parent)
+        self._build_describe_action_row(parent)
 
         self._divider(parent)
 
@@ -350,8 +386,9 @@ class TextVisionApp:
         inner.pack(fill=tk.X)
         head = tk.Frame(inner, bg=C_SURFACE)
         head.pack(fill=tk.X, padx=18, pady=(12, 0))
-        tk.Label(head, text="TEXTO RECONHECIDO", bg=C_SURFACE, fg=C_TEXT_MUTED,
-                 font=self.f_section).pack(side=tk.LEFT)
+        self._ocr_panel_title_var = tk.StringVar(value="TEXTO RECONHECIDO")
+        tk.Label(head, textvariable=self._ocr_panel_title_var, bg=C_SURFACE,
+                 fg=C_TEXT_MUTED, font=self.f_section).pack(side=tk.LEFT)
         self.ocr_meta_var = tk.StringVar(value="")
         tk.Label(head, textvariable=self.ocr_meta_var, bg=C_SURFACE,
                  fg=C_TEXT_MUTED, font=self.f_section).pack(side=tk.RIGHT)
@@ -512,6 +549,86 @@ class TextVisionApp:
             w.bind("<Enter>", lambda e: self._set_bg(widgets, C_SURFACE))
             w.bind("<Leave>", lambda e: self._set_bg(widgets, C_BG))
 
+    def _build_tts_action_row(self, parent: tk.Frame) -> None:
+        """Linha 'Ler em voz alta' com indicador de carregamento animado."""
+        row = tk.Frame(parent, bg=C_BG, cursor="hand2")
+        row.pack(fill=tk.X, pady=1)
+        pad = tk.Frame(row, bg=C_BG)
+        pad.pack(fill=tk.X, padx=2, pady=2)
+        lbl = tk.Label(pad, text="Ler em voz alta", bg=C_BG, fg=C_TEXT,
+                       font=self.f_button, anchor="w", padx=12, pady=10)
+        lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self._tts_spinner_label = tk.Label(pad, text="", bg=C_BG, fg=C_ACCENT,
+                                           font=self.f_button, padx=4, pady=10)
+        self._tts_spinner_label.pack(side=tk.LEFT)
+        kbd = tk.Label(pad, text="L", bg=C_BG, fg=C_TEXT_MUTED,
+                       font=self.f_kbd, padx=12, pady=10)
+        kbd.pack(side=tk.RIGHT)
+        widgets = (row, pad, lbl, kbd)
+        for w in widgets:
+            w.bind("<Button-1>", lambda e: self._do_speak())
+            w.bind("<Enter>", lambda e: self._set_bg(widgets, C_SURFACE))
+            w.bind("<Leave>", lambda e: self._set_bg(widgets, C_BG))
+
+    def _show_shortcuts(self) -> None:
+        """Popup com todos os atalhos de teclado, estilizado."""
+        win = tk.Toplevel(self.root)
+        win.title("Atalhos")
+        win.configure(bg=C_BG)
+        win.resizable(False, False)
+        win.attributes("-topmost", True)
+        self.root.update_idletasks()
+        rx, ry = self.root.winfo_x(), self.root.winfo_y()
+        rw = self.root.winfo_width()
+        w, h = 360, 444
+        win.geometry(f"{w}x{h}+{rx + (rw - w) // 2}+{ry + 60}")
+
+        outer = tk.Frame(win, bg=C_BORDER)
+        outer.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+        inner = tk.Frame(outer, bg=C_BG)
+        inner.pack(fill=tk.BOTH, expand=True)
+
+        hdr = tk.Frame(inner, bg=C_SURFACE_HI)
+        hdr.pack(fill=tk.X)
+        tk.Label(hdr, text="ATALHOS DE TECLADO", bg=C_SURFACE_HI, fg=C_TEXT_DIM,
+                 font=self.f_section, padx=18, pady=14).pack(side=tk.LEFT)
+        close = tk.Label(hdr, text="✕", bg=C_SURFACE_HI, fg=C_TEXT_MUTED,
+                         font=self.f_button, padx=16, pady=14, cursor="hand2")
+        close.pack(side=tk.RIGHT)
+        close.bind("<Button-1>", lambda e: win.destroy())
+        win.bind("<Escape>", lambda e: win.destroy())
+        self._hover_swap(close, C_SURFACE_HI, C_BORDER)
+
+        shortcuts = [
+            ("+ / −",  "Aumentar / diminuir zoom"),
+            ("F",      "Alternar filtro de cor"),
+            ("C",      "Ativar / desativar CLAHE"),
+            ("[ / ]",  "Diminuir / aumentar brilho"),
+            (", / .",  "Diminuir / aumentar contraste"),
+            ("O",      "Reconhecer texto (OCR)"),
+            ("L",      "Ler em voz alta"),
+            ("S",      "Alternar fonte  câmera ↔ tela"),
+            ("R",      "Selecionar região  (modo tela)"),
+            ("M",      "Lupa flutuante  (segue o cursor)"),
+            ("P",      "Pausar / retomar fonte"),
+            ("H",      "Congelar / descongelar quadro"),
+            ("Esc",    "Sair"),
+        ]
+        content = tk.Frame(inner, bg=C_BG)
+        content.pack(fill=tk.BOTH, expand=True, padx=16, pady=14)
+        for i, (key, desc) in enumerate(shortcuts):
+            row_bg = C_SURFACE if i % 2 == 0 else C_BG
+            r = tk.Frame(content, bg=row_bg)
+            r.pack(fill=tk.X)
+            tk.Label(r, text=key, bg=row_bg, fg=C_ACCENT,
+                     font=self.f_kbd, width=8, anchor="e",
+                     padx=8, pady=7).pack(side=tk.LEFT)
+            tk.Frame(r, bg=C_BORDER, width=1).pack(
+                side=tk.LEFT, fill=tk.Y, pady=3)
+            tk.Label(r, text=desc, bg=row_bg, fg=C_TEXT,
+                     font=self.f_button, anchor="w",
+                     padx=12, pady=7).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
     @staticmethod
     def _set_bg(widgets, color: str) -> None:
         for w in widgets:
@@ -541,7 +658,9 @@ class TextVisionApp:
     # ---------- Atalhos ----------
 
     def _bind_keys(self) -> None:
-        b = self.root.bind
+        # bind_all garante que os atalhos funcionam mesmo quando o foco
+        # está no indicador flutuante (root iconificada).
+        b = self.root.bind_all
         b("<plus>",        lambda e: self._set_zoom(self.settings.zoom + 0.5))
         b("<KP_Add>",      lambda e: self._set_zoom(self.settings.zoom + 0.5))
         b("<equal>",       lambda e: self._set_zoom(self.settings.zoom + 0.5))
@@ -555,12 +674,14 @@ class TextVisionApp:
         b("<period>",       lambda e: self._set_contrast(self.settings.contrast + 0.1))
         for k in ("o", "O"): b(f"<{k}>", lambda e: self._do_ocr())
         for k in ("l", "L"): b(f"<{k}>", lambda e: self._do_speak())
+        for k in ("d", "D"): b(f"<{k}>", lambda e: self._do_describe())
         for k in ("p", "P"): b(f"<{k}>", lambda e: self._toggle_pause())
         for k in ("h", "H"): b(f"<{k}>", lambda e: self._toggle_freeze())
         for k in ("s", "S"): b(f"<{k}>", lambda e: self._toggle_source())
         for k in ("r", "R"): b(f"<{k}>", lambda e: self._select_region())
         for k in ("m", "M"): b(f"<{k}>", lambda e: self._toggle_magnifier())
-        b("<Escape>", lambda e: self._on_close())
+        b("<space>",  lambda e: self._capture_for_describe())
+        b("<Escape>", lambda e: self._on_esc())
 
     # ---------- Setters / toggles ----------
 
@@ -625,7 +746,15 @@ class TextVisionApp:
         self._refresh_source_switch()
         if target == self.SOURCE_SCREEN:
             self._set_status("Modo Tela ativado · use R para selecionar uma região")
+            # Salva geometria antes de minimizar para restaurar depois
+            self._last_normal_geom = self.root.geometry()
+            self.root.iconify()
+            self.root.update_idletasks()
+            self._show_screen_indicator()
         else:
+            self._hide_screen_indicator()
+            self.root.deiconify()
+            self.root.lift()
             self._set_status("Modo Câmera")
 
     def _cycle_language(self) -> None:
@@ -652,7 +781,12 @@ class TextVisionApp:
         self.ocr_text.configure(state=tk.DISABLED)
         self.ocr_meta_var.set("")
 
-    def _show_ocr_text(self, text: str, meta: str = "", warn: bool = False) -> None:
+    def _show_ocr_text(self, text: str, meta: str = "", warn: bool = False,
+                       panel_title: str = "TEXTO RECONHECIDO") -> None:
+        try:
+            self._ocr_panel_title_var.set(panel_title)
+        except AttributeError:
+            pass
         self.ocr_text.configure(
             state=tk.NORMAL,
             fg=C_WARN if warn else C_TEXT,
@@ -730,6 +864,7 @@ class TextVisionApp:
             self._set_status(f"TTS indisponível: {self.tts.error}")
         else:
             self._set_status("Lendo em voz alta…")
+            self._start_tts_spinner()
 
     # ---------- Tela: seleção e magnifier ----------
 
@@ -739,13 +874,20 @@ class TextVisionApp:
         if self.screen.virtual is None:
             self._set_status("Captura de tela indisponível.")
             return
-        # esconde a janela durante a seleção para não nos vermos a nós mesmos
-        self.root.withdraw()
-        self.root.update_idletasks()
+        if self._screen_indicator is not None:
+            try:
+                self._screen_indicator.withdraw()
+            except Exception:
+                pass
+        # No Windows, Toplevels filhos ficam ocultos quando o owner está
+        # iconic/withdrawn. Mantemos root em estado "normal" mas invisível
+        # (alpha=0 + fora da tela) para que o seletor apareça corretamente.
+        self._overlay_hide_root()
         time.sleep(0.15)
 
         def done(region: Region | None) -> None:
-            self.root.deiconify()
+            self._hide_screen_indicator()
+            self._overlay_show_root()
             if region and region.is_valid():
                 self.screen.set_region(region)
                 self._set_status(
@@ -772,6 +914,339 @@ class TextVisionApp:
         self.magnifier.open()
         self._set_status("Lupa do cursor ativa · Esc fecha a janelinha")
 
+    # ---------- Descrição de imagem (BLIP) ----------
+
+    def _build_describe_action_row(self, parent: tk.Frame) -> None:
+        """Linha 'Descrever imagem' com spinner de carregamento."""
+        row = tk.Frame(parent, bg=C_BG, cursor="hand2")
+        row.pack(fill=tk.X, pady=1)
+        pad = tk.Frame(row, bg=C_BG)
+        pad.pack(fill=tk.X, padx=2, pady=2)
+        lbl = tk.Label(pad, text="Descrever imagem", bg=C_BG, fg=C_TEXT,
+                       font=self.f_button, anchor="w", padx=12, pady=10)
+        lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self._describe_spinner_label = tk.Label(pad, text="", bg=C_BG, fg=C_ACCENT,
+                                                font=self.f_button, padx=4, pady=10)
+        self._describe_spinner_label.pack(side=tk.LEFT)
+        kbd = tk.Label(pad, text="D", bg=C_BG, fg=C_TEXT_MUTED,
+                       font=self.f_kbd, padx=12, pady=10)
+        kbd.pack(side=tk.RIGHT)
+        widgets = (row, pad, lbl, kbd)
+        for w in widgets:
+            w.bind("<Button-1>", lambda e: self._do_describe())
+            w.bind("<Enter>", lambda e: self._set_bg(widgets, C_SURFACE))
+            w.bind("<Leave>", lambda e: self._set_bg(widgets, C_BG))
+
+    def _bind_sidebar_scroll(self, widget: tk.Widget) -> None:
+        """Vincula roda do mouse ao canvas da sidebar recursivamente."""
+        def _scroll(event):
+            self._sidebar_canvas.yview_scroll(-1 * (event.delta // 120), "units")
+        widget.bind("<MouseWheel>", _scroll)
+        for child in widget.winfo_children():
+            self._bind_sidebar_scroll(child)
+
+    def _do_describe(self) -> None:
+        if self._describe_loading:
+            return
+        if self.source == self.SOURCE_SCREEN:
+            self._describe_screen_region()
+        else:
+            self._enter_describe_camera_mode()
+
+    def _enter_describe_camera_mode(self) -> None:
+        self._describe_mode = "camera"
+        self._set_status(
+            "Centralize o objeto na mira  ·  ESPAÇO para capturar  ·  Esc para cancelar"
+        )
+
+    def _capture_for_describe(self) -> None:
+        if self._describe_mode != "camera":
+            return
+        # Não captura se um widget de texto tiver foco
+        focus = self.root.focus_get()
+        if isinstance(focus, tk.Text):
+            return
+        frame = self.last_source_frame
+        if frame is None:
+            self._set_status("Sem quadro disponível para descrição.")
+            return
+        self._describe_mode = None
+        # Recorta a região central (60% × 65%) — área da mira
+        h, w = frame.shape[:2]
+        rw, rh = int(w * 0.62), int(h * 0.65)
+        x0, y0 = (w - rw) // 2, (h - rh) // 2
+        crop = frame[y0:y0 + rh, x0:x0 + rw]
+        self._start_describe_spinner()
+        self._set_status("Descrevendo imagem…")
+        threading.Thread(target=self._describe_worker, args=(crop,), daemon=True).start()
+
+    def _describe_screen_region(self) -> None:
+        if self.source != self.SOURCE_SCREEN:
+            self._toggle_source()
+        if self.screen.virtual is None:
+            self._set_status("Captura de tela indisponível.")
+            return
+        if self._screen_indicator is not None:
+            try:
+                self._screen_indicator.withdraw()
+            except Exception:
+                pass
+        self._overlay_hide_root()
+        time.sleep(0.15)
+
+        def done(region: Region | None) -> None:
+            self._hide_screen_indicator()
+            self._overlay_show_root()
+            if region and region.is_valid():
+                frame = self.screen.grab_once(region)
+                if frame is not None:
+                    self._start_describe_spinner()
+                    self._set_status("Descrevendo imagem…")
+                    threading.Thread(
+                        target=self._describe_worker, args=(frame,), daemon=True
+                    ).start()
+                else:
+                    self._set_status("Falha ao capturar a região.")
+            else:
+                self._set_status("Captura cancelada.")
+            self._photo_size = (0, 0)
+
+        sel = RegionSelector(self.root, self.screen.virtual)
+        sel.run(done)
+
+    def _describe_worker(self, frame: np.ndarray) -> None:
+        result = self.blip.describe(frame)
+        if not self._closing:
+            self.root.after(0, lambda: self._on_describe_done(result))
+
+    def _on_describe_done(self, result: BLIPDescribeResult) -> None:
+        self._stop_describe_spinner()
+        if not result.ok:
+            self._show_ocr_text(
+                result.note or "Descrição falhou.", "",
+                warn=True, panel_title="DESCRIÇÃO DA IMAGEM",
+            )
+            self._set_status("Descrição indisponível.")
+            return
+        meta = f"BLIP  ·  {result.elapsed_ms:.0f} ms"
+        self._show_ocr_text(
+            result.text, meta, panel_title="DESCRIÇÃO DA IMAGEM"
+        )
+        self._set_status(f"Descrição gerada em {result.elapsed_ms:.0f} ms  (em inglês)")
+
+    def _draw_describe_reticle(self, frame: np.ndarray) -> np.ndarray:
+        """Desenha mira centralizada com escurecimento externo."""
+        out = frame.copy()
+        h, w = out.shape[:2]
+        rw, rh = int(w * 0.62), int(h * 0.65)
+        x0, y0 = (w - rw) // 2, (h - rh) // 2
+        x1, y1 = x0 + rw, y0 + rh
+
+        # Escurece a área externa
+        dim = np.full_like(out, (14, 14, 16), dtype=np.uint8)
+        cv2.addWeighted(out, 0.35, dim, 0.65, 0, out)
+        # Restaura o interior
+        out[y0:y1, x0:x1] = frame[y0:y1, x0:x1]
+
+        # Cantos com brackets — cor C_ACCENT em BGR
+        accent = (255, 197, 158)
+        L, T = 22, 2
+        for cx, cy, dx, dy in [
+            (x0, y0, 1, 1), (x1, y0, -1, 1),
+            (x0, y1, 1, -1), (x1, y1, -1, -1),
+        ]:
+            cv2.line(out, (cx, cy), (cx + dx * L, cy), accent, T + 1)
+            cv2.line(out, (cx, cy), (cx, cy + dy * L), accent, T + 1)
+
+        # Mira central
+        cx, cy = w // 2, h // 2
+        cv2.line(out, (cx - 12, cy), (cx + 12, cy), accent, 1)
+        cv2.line(out, (cx, cy - 12), (cx, cy + 12), accent, 1)
+        cv2.circle(out, (cx, cy), 3, accent, 1)
+
+        # Texto de dica abaixo da mira
+        hint = "ESPACO: capturar   ESC: cancelar"
+        fs, thick, font = 0.42, 1, cv2.FONT_HERSHEY_SIMPLEX
+        (tw, th), _ = cv2.getTextSize(hint, font, fs, thick)
+        tx = max(0, (w - tw) // 2)
+        ty = min(h - 6, y1 + th + 10)
+        cv2.rectangle(out, (tx - 5, ty - th - 4), (tx + tw + 5, ty + 4),
+                      (14, 14, 16), -1)
+        cv2.putText(out, hint, (tx, ty), font, fs, accent, thick, cv2.LINE_AA)
+        return out
+
+    def _start_describe_spinner(self) -> None:
+        self._describe_loading = True
+        self._describe_spinner_frame = 0
+        self._describe_start_time = time.time()
+        self._animate_describe_spinner()
+
+    def _stop_describe_spinner(self) -> None:
+        self._describe_loading = False
+        try:
+            self._describe_spinner_label.configure(text="")
+        except (AttributeError, tk.TclError):
+            pass
+
+    def _animate_describe_spinner(self) -> None:
+        if not self._describe_loading or self._closing:
+            return
+        frames = ("◐", "◓", "◑", "◒")
+        try:
+            self._describe_spinner_label.configure(
+                text=frames[self._describe_spinner_frame % 4]
+            )
+        except (AttributeError, tk.TclError):
+            pass
+        self._describe_spinner_frame += 1
+        self.root.after(200, self._animate_describe_spinner)
+
+    # ---------- Indicador de tela flutuante ----------
+
+    def _show_screen_indicator(self) -> None:
+        """Cria pequeno painel flutuante no canto superior direito enquanto
+        a janela principal está minimizada no modo Tela."""
+        if self._screen_indicator is not None:
+            return
+        ind = tk.Toplevel()
+        ind.overrideredirect(True)
+        ind.attributes("-topmost", True)
+        try:
+            ind.attributes("-alpha", 0.95)
+        except tk.TclError:
+            pass
+        ind.configure(bg=C_BG)
+        sw = self.root.winfo_screenwidth()
+        w, h = 232, 118
+        ind.geometry(f"{w}x{h}+{sw - w - 20}+20")
+
+        outer = tk.Frame(ind, bg=C_BORDER)
+        outer.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+        panel = tk.Frame(outer, bg=C_SURFACE)
+        panel.pack(fill=tk.BOTH, expand=True)
+
+        hdr = tk.Frame(panel, bg=C_SURFACE_HI)
+        hdr.pack(fill=tk.X)
+        tk.Label(hdr, text="TextVision", bg=C_SURFACE_HI, fg=C_TEXT,
+                 font=self.f_button, padx=12, pady=8).pack(side=tk.LEFT)
+        tk.Label(hdr, text="● ATIVO", bg=C_SURFACE_HI, fg="#5cb85c",
+                 font=self.f_kbd, padx=10).pack(side=tk.RIGHT)
+
+        btns = tk.Frame(panel, bg=C_SURFACE)
+        btns.pack(fill=tk.X, padx=8, pady=(6, 8))
+
+        # Linha 1: Selecionar + Câmera
+        row1 = tk.Frame(btns, bg=C_SURFACE)
+        row1.pack(fill=tk.X, pady=(0, 4))
+        reg = tk.Label(row1, text="Selecionar  R", bg=C_ACCENT_DIM,
+                       fg=C_TEXT, font=self.f_kbd, padx=8, pady=5, cursor="hand2")
+        reg.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        reg.bind("<Button-1>", lambda e: self._select_region())
+        self._hover_swap(reg, C_ACCENT_DIM, "#2a4a6e")
+
+        rst = tk.Label(row1, text="Câmera  S", bg=C_SURFACE_HI,
+                       fg=C_TEXT_DIM, font=self.f_kbd, padx=8, pady=5, cursor="hand2")
+        rst.pack(side=tk.LEFT)
+        rst.bind("<Button-1>", lambda e: self._toggle_source())
+        self._hover_swap(rst, C_SURFACE_HI, C_BORDER)
+
+        # Linha 2: Descrever imagem
+        desc = tk.Label(btns, text="Descrever imagem  D", bg=C_SURFACE_HI,
+                        fg=C_TEXT, font=self.f_kbd, padx=8, pady=5, cursor="hand2")
+        desc.pack(fill=tk.X)
+        desc.bind("<Button-1>", lambda e: self._do_describe())
+        self._hover_swap(desc, C_SURFACE_HI, C_BORDER)
+
+        # focus_force garante que o indicador recebe eventos de teclado
+        # (os atalhos R/S/D/etc. são tratados via bind_all no root)
+        ind.focus_force()
+
+        self._screen_indicator = ind
+
+    def _hide_screen_indicator(self) -> None:
+        if self._screen_indicator is not None:
+            try:
+                self._screen_indicator.destroy()
+            except Exception:
+                pass
+            self._screen_indicator = None
+
+    def _overlay_hide_root(self) -> None:
+        """Oculta a janela principal mantendo-a em estado 'normal'.
+
+        No Windows, Toplevels criados com um pai iconic/withdrawn não
+        aparecem na tela. Esta função mantém o root em 'normal' mas
+        invisível (alpha=0 + posição fora da tela) para que overlays
+        filhos (RegionSelector) possam ser exibidos corretamente.
+        """
+        if self.root.state() == "iconic":
+            # Deiconify para sair do estado iconic — mas primeiro torna
+            # invisível para evitar flash visual.
+            try:
+                self.root.attributes("-alpha", 0.0)
+            except Exception:
+                pass
+            self.root.deiconify()
+        else:
+            try:
+                self.root.attributes("-alpha", 0.0)
+            except Exception:
+                pass
+        self.root.update_idletasks()
+        # Move para fora da área visível para não aparecer na captura de tela
+        sw = self.root.winfo_screenwidth()
+        self.root.geometry(f"+{sw + 200}+0")
+        self.root.update_idletasks()
+
+    def _overlay_show_root(self) -> None:
+        """Restaura a janela principal após um overlay de seleção."""
+        # Restaura geometria original (salva antes de iconificar)
+        geom = getattr(self, "_last_normal_geom", None)
+        if geom:
+            self.root.geometry(geom)
+        else:
+            self.root.geometry("")
+        try:
+            self.root.attributes("-alpha", 1.0)
+        except Exception:
+            pass
+        self.root.deiconify()
+        self.root.lift()
+
+    # ---------- Spinner TTS ----------
+
+    def _start_tts_spinner(self) -> None:
+        self._tts_loading = True
+        self._tts_spinner_frame = 0
+        self._tts_speak_start = time.time()
+        self._animate_tts_spinner()
+
+    def _stop_tts_spinner(self) -> None:
+        self._tts_loading = False
+        try:
+            self._tts_spinner_label.configure(text="")
+        except (AttributeError, tk.TclError):
+            pass
+
+    def _animate_tts_spinner(self) -> None:
+        if not self._tts_loading or self._closing:
+            return
+        frames = ("◐", "◓", "◑", "◒")
+        try:
+            self._tts_spinner_label.configure(
+                text=frames[self._tts_spinner_frame % 4]
+            )
+        except (AttributeError, tk.TclError):
+            pass
+        self._tts_spinner_frame += 1
+        elapsed = time.time() - self._tts_speak_start
+        if elapsed > 1.0 and not self.tts.is_speaking:
+            self._stop_tts_spinner()
+            if not self._ocr_running:
+                self._set_status("Leitura concluída.")
+            return
+        self.root.after(200, self._animate_tts_spinner)
+
     # ---------- Loop de exibição ----------
 
     def _update_frame(self) -> None:
@@ -786,6 +1261,8 @@ class TextVisionApp:
             if source is not None:
                 self.last_source_frame = source
                 processed = process_frame(source, self.settings)
+                if self._describe_mode == "camera":
+                    processed = self._draw_describe_reticle(processed)
                 self.last_processed = processed
                 display = self._fit_to_display(processed, DISPLAY_MAX_W, DISPLAY_MAX_H)
                 rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
@@ -854,10 +1331,23 @@ class TextVisionApp:
 
     # ---------- Encerramento ----------
 
+    def _on_esc(self) -> None:
+        """Esc cancela o modo descrever (câmera); se não estiver em modo
+        descrever, encerra o aplicativo."""
+        if self._describe_mode == "camera":
+            self._describe_mode = None
+            self._set_status("Modo de descrição cancelado.")
+            return
+        self._on_close()
+
     def _on_close(self) -> None:
         if self._closing:
             return
         self._closing = True
+        try:
+            self._hide_screen_indicator()
+        except Exception:
+            pass
         try:
             if self.magnifier:
                 self.magnifier.close()
