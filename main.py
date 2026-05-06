@@ -176,6 +176,7 @@ class TextVisionApp:
         self._screen_reader_thread: threading.Thread | None = None
         self._screen_reader_last_text: str = ""
         self._reader_status_var: tk.StringVar | None = None
+        self._indicator_filter_var: tk.StringVar | None = None
 
         # Fontes
         self.camera = CameraStream(CAMERA_INDEX)
@@ -721,6 +722,13 @@ class TextVisionApp:
     def _cycle_filter(self) -> None:
         self.settings.filter_mode = cycle_filter(self.settings.filter_mode, 1)
         self.filter_var.set(FILTER_LABELS[self.settings.filter_mode])
+        if self._indicator_filter_var is not None:
+            try:
+                self._indicator_filter_var.set(
+                    f"Filtro: {FILTER_LABELS[self.settings.filter_mode]}"
+                )
+            except tk.TclError:
+                pass
 
     def _toggle_clahe_action(self) -> None:
         self.clahe_var.set(not self.clahe_var.get())
@@ -760,12 +768,11 @@ class TextVisionApp:
         self._photo_size = (0, 0)  # forçar recriação do PhotoImage
         self._refresh_source_switch()
         if target == self.SOURCE_SCREEN:
-            self._set_status("Modo Tela · lendo em voz alta…")
+            self._set_status("Modo Tela ativado · clique em 'Ler em voz alta' para iniciar")
             self._last_normal_geom = self.root.geometry()
             self.root.iconify()
             self.root.update_idletasks()
             self._show_screen_indicator()
-            self._start_screen_reader()
         else:
             self._stop_screen_reader()
             self._hide_screen_indicator()
@@ -872,6 +879,9 @@ class TextVisionApp:
             self._set_status(f"OCR concluído em {result.elapsed_ms:.0f} ms")
 
     def _do_speak(self) -> None:
+        if self.source == self.SOURCE_SCREEN:
+            self._open_window_picker()
+            return
         if not self.last_ocr_text.strip():
             self._set_status("Execute o OCR antes de ler em voz alta.")
             return
@@ -1134,7 +1144,12 @@ class TextVisionApp:
         a janela principal está minimizada no modo Tela."""
         if self._screen_indicator is not None:
             return
-        self._reader_status_var = tk.StringVar(value="Iniciando leitura…")
+        self._reader_status_var = tk.StringVar(
+            value="Clique em 'Ler em voz alta' para começar"
+        )
+        self._indicator_filter_var = tk.StringVar(
+            value=f"Filtro: {FILTER_LABELS[self.settings.filter_mode]}"
+        )
         ind = tk.Toplevel()
         ind.overrideredirect(True)
         ind.attributes("-topmost", True)
@@ -1153,49 +1168,180 @@ class TextVisionApp:
         hdr.pack(fill=tk.X)
         tk.Label(hdr, text="TextVision", bg=C_SURFACE_HI, fg=C_TEXT,
                  font=self.f_button, padx=12, pady=8).pack(side=tk.LEFT)
-        tk.Label(hdr, text="● LENDO", bg=C_SURFACE_HI, fg="#5cb85c",
+        tk.Label(hdr, text="● TELA", bg=C_SURFACE_HI, fg=C_ACCENT,
                  font=self.f_kbd, padx=10).pack(side=tk.RIGHT)
 
-        # Trecho do texto atualmente sendo lido
         status_frame = tk.Frame(panel, bg=C_SURFACE)
         status_frame.pack(fill=tk.X, padx=8, pady=(4, 2))
         tk.Label(
             status_frame, textvariable=self._reader_status_var,
             bg=C_SURFACE, fg=C_TEXT_DIM, font=self.f_status,
-            anchor="w", justify=tk.LEFT, wraplength=260,
+            anchor="w", justify=tk.LEFT, wraplength=268,
         ).pack(fill=tk.X)
 
         btns = tk.Frame(panel, bg=C_SURFACE)
         btns.pack(fill=tk.X, padx=8, pady=(4, 8))
 
-        cam = tk.Label(btns, text="Câmera  S", bg=C_SURFACE_HI,
-                       fg=C_TEXT, font=self.f_kbd, padx=8, pady=5, cursor="hand2")
-        cam.pack(fill=tk.X, pady=(0, 4))
-        cam.bind("<Button-1>", lambda e: self._set_source(self.SOURCE_CAMERA))
-        self._hover_swap(cam, C_SURFACE_HI, C_BORDER)
+        speak_btn = tk.Label(btns, text="Ler em voz alta  L", bg=C_ACCENT_DIM,
+                             fg=C_TEXT, font=self.f_kbd, padx=8, pady=5, cursor="hand2")
+        speak_btn.pack(fill=tk.X, pady=(0, 4))
+        speak_btn.bind("<Button-1>", lambda e: self._open_window_picker())
+        self._hover_swap(speak_btn, C_ACCENT_DIM, "#2a4a6e")
 
-        desc = tk.Label(btns, text="Descrever imagem  D", bg=C_SURFACE_HI,
-                        fg=C_TEXT, font=self.f_kbd, padx=8, pady=5, cursor="hand2")
-        desc.pack(fill=tk.X)
-        desc.bind("<Button-1>", lambda e: self._do_describe())
-        self._hover_swap(desc, C_SURFACE_HI, C_BORDER)
+        desc_btn = tk.Label(btns, text="Descrever imagem  D", bg=C_SURFACE_HI,
+                            fg=C_TEXT, font=self.f_kbd, padx=8, pady=5, cursor="hand2")
+        desc_btn.pack(fill=tk.X, pady=(0, 8))
+        desc_btn.bind("<Button-1>", lambda e: self._do_describe())
+        self._hover_swap(desc_btn, C_SURFACE_HI, C_BORDER)
+
+        tk.Frame(btns, bg=C_BORDER, height=1).pack(fill=tk.X, pady=(0, 8))
+
+        filter_btn = tk.Label(btns, textvariable=self._indicator_filter_var,
+                              bg=C_SURFACE_HI, fg=C_TEXT_DIM,
+                              font=self.f_kbd, padx=8, pady=5, cursor="hand2")
+        filter_btn.pack(fill=tk.X, pady=(0, 4))
+        filter_btn.bind("<Button-1>", lambda e: self._cycle_filter())
+        self._hover_swap(filter_btn, C_SURFACE_HI, C_BORDER)
+
+        mag_btn = tk.Label(btns, text="Lupa do cursor  M", bg=C_SURFACE_HI,
+                           fg=C_TEXT_DIM, font=self.f_kbd, padx=8, pady=5, cursor="hand2")
+        mag_btn.pack(fill=tk.X, pady=(0, 4))
+        mag_btn.bind("<Button-1>", lambda e: self._toggle_magnifier())
+        self._hover_swap(mag_btn, C_SURFACE_HI, C_BORDER)
+
+        cam_btn = tk.Label(btns, text="Câmera  S", bg=C_SURFACE_HI,
+                           fg=C_TEXT, font=self.f_kbd, padx=8, pady=5, cursor="hand2")
+        cam_btn.pack(fill=tk.X)
+        cam_btn.bind("<Button-1>", lambda e: self._set_source(self.SOURCE_CAMERA))
+        self._hover_swap(cam_btn, C_SURFACE_HI, C_BORDER)
 
         ind.update_idletasks()
-        w = max(280, ind.winfo_reqwidth() + 4)
+        w = max(290, ind.winfo_reqwidth() + 4)
         h = ind.winfo_reqheight() + 4
         sw = self.root.winfo_screenwidth()
         ind.geometry(f"{w}x{h}+{sw - w - 20}+20")
         ind.focus_force()
         self._screen_indicator = ind
 
-    # ---------- Screen reader em tempo real ----------
+    # ---------- Window picker / screen reader ----------
 
-    def _start_screen_reader(self) -> None:
+    def _open_window_picker(self) -> None:
+        """Mostra lista de janelas abertas para o usuário escolher qual ler."""
+        windows = self._enumerate_windows()
+        if not windows:
+            self._update_reader_status("Nenhuma janela disponível.")
+            return
+
+        picker = tk.Toplevel()
+        picker.overrideredirect(True)
+        picker.attributes("-topmost", True)
+        try:
+            picker.attributes("-alpha", 0.97)
+        except tk.TclError:
+            pass
+        picker.configure(bg=C_BG)
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        w, h = 460, min(420, 76 + len(windows) * 36 + 20)
+        picker.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
+
+        outer = tk.Frame(picker, bg=C_BORDER)
+        outer.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+        inner = tk.Frame(outer, bg=C_BG)
+        inner.pack(fill=tk.BOTH, expand=True)
+
+        hdr = tk.Frame(inner, bg=C_SURFACE_HI)
+        hdr.pack(fill=tk.X)
+        tk.Label(hdr, text="Selecionar janela para leitura",
+                 bg=C_SURFACE_HI, fg=C_TEXT, font=self.f_button,
+                 padx=14, pady=10).pack(side=tk.LEFT)
+        close_lbl = tk.Label(hdr, text="✕", bg=C_SURFACE_HI, fg=C_TEXT_MUTED,
+                             font=self.f_button, padx=12, pady=10, cursor="hand2")
+        close_lbl.pack(side=tk.RIGHT)
+        close_lbl.bind("<Button-1>", lambda e: picker.destroy())
+        self._hover_swap(close_lbl, C_SURFACE_HI, C_BORDER)
+
+        tk.Label(inner, text="Clique na janela que deseja ler em voz alta:",
+                 bg=C_BG, fg=C_TEXT_DIM, font=self.f_status,
+                 padx=14, pady=6, anchor="w").pack(fill=tk.X)
+
+        scroll_wrap = tk.Frame(inner, bg=C_BG)
+        scroll_wrap.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+        cvs = tk.Canvas(scroll_wrap, bg=C_BG, bd=0, highlightthickness=0)
+        sb = ttk.Scrollbar(scroll_wrap, orient=tk.VERTICAL, command=cvs.yview)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        cvs.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        cvs.configure(yscrollcommand=sb.set)
+        list_frame = tk.Frame(cvs, bg=C_BG)
+        _wid = cvs.create_window((0, 0), window=list_frame, anchor="nw")
+        list_frame.bind("<Configure>", lambda e: cvs.configure(
+            scrollregion=cvs.bbox("all")))
+        cvs.bind("<Configure>", lambda e: cvs.itemconfig(_wid, width=e.width))
+        picker.bind("<Escape>", lambda e: picker.destroy())
+
+        def _select(hwnd, title):
+            picker.destroy()
+            self.root.after(150, lambda: self._start_window_reader(hwnd, title))
+
+        for i, (hwnd, title) in enumerate(windows):
+            nbg = C_SURFACE if i % 2 == 0 else C_BG
+            row = tk.Frame(list_frame, bg=nbg, cursor="hand2")
+            row.pack(fill=tk.X)
+            lbl = tk.Label(row, text=title[:65], bg=nbg, fg=C_TEXT,
+                           font=self.f_button, anchor="w", padx=12, pady=7)
+            lbl.pack(fill=tk.X)
+
+            def _bind(r, l, n, h_id, t):
+                def _on_enter(_): r.configure(bg=C_SURFACE_HI); l.configure(bg=C_SURFACE_HI)
+                def _on_leave(_): r.configure(bg=n); l.configure(bg=n)
+                def _on_click(_): _select(h_id, t)
+                for widget in (r, l):
+                    widget.bind("<Enter>", _on_enter)
+                    widget.bind("<Leave>", _on_leave)
+                    widget.bind("<Button-1>", _on_click)
+
+            _bind(row, lbl, nbg, hwnd, title)
+
+    @staticmethod
+    def _enumerate_windows() -> list[tuple[int, str]]:
+        """Lista janelas visíveis com título, excluindo janelas de sistema."""
+        import ctypes
+        from ctypes import wintypes
+        _u = ctypes.windll.user32
+        GWL_EXSTYLE, GWL_STYLE = -20, -16
+        WS_EX_TOOLWINDOW = 0x00000080
+        WS_CAPTION = 0x00C00000
+        windows: list[tuple[int, str]] = []
+        EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+
+        def _cb(hwnd, _):
+            if not _u.IsWindowVisible(hwnd):
+                return True
+            if _u.GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW:
+                return True
+            if not (_u.GetWindowLongW(hwnd, GWL_STYLE) & WS_CAPTION):
+                return True
+            n = _u.GetWindowTextLengthW(hwnd)
+            if n == 0:
+                return True
+            buf = ctypes.create_unicode_buffer(n + 1)
+            _u.GetWindowTextW(hwnd, buf, n + 1)
+            title = buf.value.strip()
+            if title and title not in ("TextVision", "Program Manager"):
+                windows.append((int(hwnd), title))
+            return True
+
+        _u.EnumWindows(EnumWindowsProc(_cb), 0)
+        return windows
+
+    def _start_window_reader(self, hwnd: int, title: str) -> None:
+        """Para qualquer leitura anterior e inicia a leitura da janela indicada."""
         self._stop_screen_reader()
         self._screen_reader_active = True
         self._screen_reader_last_text = ""
+        self._update_reader_status(f"Lendo: {title[:35]}…")
         self._screen_reader_thread = threading.Thread(
-            target=self._screen_reader_loop, daemon=True
+            target=self._window_reader_loop, args=(hwnd,), daemon=True
         )
         self._screen_reader_thread.start()
 
@@ -1206,16 +1352,33 @@ class TextVisionApp:
             self._screen_reader_thread.join(timeout=2.0)
             self._screen_reader_thread = None
 
-    def _screen_reader_loop(self) -> None:
-        """Captura a tela inteira, extrai texto (PSM 3 = ordem ocidental)
-        e fala via TTS sempre que o conteúdo muda."""
-        if not self.screen.monitors or len(self.screen.monitors) < 2:
-            return
-        mon = self.screen.monitors[1]
-        region = Region(mon["left"], mon["top"], mon["width"], mon["height"])
+    def _window_reader_loop(self, hwnd: int) -> None:
+        """Thread: OCR em loop na janela selecionada, fala texto novo via TTS."""
+        import ctypes
+        from ctypes import wintypes
+        _u = ctypes.windll.user32
+        try:
+            _u.ShowWindow(hwnd, 9)  # SW_RESTORE
+            _u.SetForegroundWindow(hwnd)
+            time.sleep(0.4)
+        except Exception:
+            pass
 
         while self._screen_reader_active and not self._closing:
-            frame = self.screen.grab_once(region)
+            try:
+                rect = wintypes.RECT()
+                _u.GetWindowRect(hwnd, ctypes.byref(rect))
+                left, top = rect.left, rect.top
+                width = rect.right - rect.left
+                height = rect.bottom - rect.top
+            except Exception:
+                time.sleep(0.5)
+                continue
+            if width < 8 or height < 8:
+                time.sleep(0.5)
+                continue
+
+            frame = self.screen.grab_once(Region(left, top, width, height))
             if frame is None:
                 time.sleep(0.5)
                 continue
@@ -1234,14 +1397,12 @@ class TextVisionApp:
                 self.tts.cancel()
                 self.tts.speak(text)
 
-            # Aguarda TTS terminar antes de capturar novamente
             waited = 0.0
             while (self.tts.is_speaking and self._screen_reader_active
-                   and not self._closing and waited < 60.0):
+                   and not self._closing and waited < 120.0):
                 time.sleep(0.2)
                 waited += 0.2
 
-            # Pausa curta e interrompível antes de reler
             for _ in range(5):
                 if not self._screen_reader_active or self._closing:
                     break
@@ -1250,7 +1411,7 @@ class TextVisionApp:
     def _update_reader_status(self, text: str) -> None:
         if self._reader_status_var is not None:
             try:
-                self._reader_status_var.set(text or "Aguardando texto…")
+                self._reader_status_var.set(text)
             except tk.TclError:
                 pass
 
