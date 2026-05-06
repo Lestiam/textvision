@@ -1028,25 +1028,32 @@ class TextVisionApp:
     def _open_describe_selector(self) -> None:
         def done(region: Region | None) -> None:
             self._hide_screen_indicator()
-            self._overlay_show_root()
             if region and region.is_valid():
-                frame = self.screen.grab_once(region)
-                if frame is not None:
-                    # Atualiza o live view para mostrar a mesma região descrita
-                    self.screen.set_region(region)
-                    self._start_describe_spinner()
-                    self._set_status("Descrevendo imagem…")
-                    threading.Thread(
-                        target=self._describe_worker, args=(frame,), daemon=True
-                    ).start()
-                else:
-                    self._set_status("Falha ao capturar a região.")
+                # Captura ANTES de restaurar a janela principal, com pequena pausa
+                # para garantir que o seletor desapareceu completamente da tela.
+                self.root.after(100, lambda: self._capture_and_describe(region))
             else:
+                self._overlay_show_root()
                 self._set_status("Captura cancelada.")
             self._photo_size = (0, 0)
 
         sel = RegionSelector(self.root, self.screen.virtual, self._dpi_scale)
         sel.run(done)
+
+    def _capture_and_describe(self, region: Region) -> None:
+        """Captura a região (janela principal ainda oculta) e inicia o BLIP."""
+        frame = self.screen.grab_once(region)
+        self._overlay_show_root()
+        if frame is not None:
+            self.screen.set_region(region)
+            self._start_describe_spinner()
+            self._set_status("Descrevendo imagem…")
+            threading.Thread(
+                target=self._describe_worker, args=(frame,), daemon=True
+            ).start()
+        else:
+            self._set_status("Falha ao capturar a região.")
+        self._photo_size = (0, 0)
 
     def _describe_worker(self, frame: np.ndarray) -> None:
         result = self.blip.describe(frame)

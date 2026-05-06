@@ -425,6 +425,13 @@ class TTSEngine:
                 return
             self._speaking_event.set()
             try:
+                # pyttsx3.init() cacheia a instância; limpar o cache antes de
+                # cada chamada garante um engine SAPI5 novo, evitando o bug
+                # onde runAndWait() não funciona na segunda fala do processo.
+                try:
+                    pyttsx3._activeEngines.clear()
+                except Exception:
+                    pass
                 engine = pyttsx3.init()
                 engine.setProperty("rate", self.rate)
                 engine.say(item)
