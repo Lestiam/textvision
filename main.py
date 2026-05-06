@@ -1066,9 +1066,10 @@ class TextVisionApp:
         self._show_ocr_text(
             result.text, meta, panel_title="DESCRIÇÃO DA IMAGEM"
         )
-        # Permite que TTS leia a descrição com L / "Ler em voz alta"
         self.last_ocr_text = result.text
         self._set_status(f"Descrição gerada em {result.elapsed_ms:.0f} ms  (em inglês)")
+        if self.tts.speak(result.text):
+            self._start_tts_spinner()
 
     def _draw_describe_reticle(self, frame: np.ndarray) -> np.ndarray:
         """Desenha mira centralizada com escurecimento externo."""
