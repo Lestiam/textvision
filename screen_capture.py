@@ -163,9 +163,10 @@ class RegionSelector:
     BG = "#000000"
     LINE = "#9ec5ff"
 
-    def __init__(self, parent: tk.Misc, virtual_bbox: dict) -> None:
+    def __init__(self, parent: tk.Misc, virtual_bbox: dict, dpi_scale: float = 1.0) -> None:
         self.parent = parent
-        self.bbox = virtual_bbox
+        self.bbox = virtual_bbox  # dimensões em pixels físicos (mss)
+        self.dpi_scale = dpi_scale  # fator físico/lógico (>1 em HiDPI no Windows)
         self.top: tk.Toplevel | None = None
         self.canvas: tk.Canvas | None = None
         self._start: tuple[int, int] | None = None
@@ -180,8 +181,11 @@ class RegionSelector:
         self.top.attributes("-topmost", True)
         self.top.attributes("-alpha", 0.30)
         self.top.configure(bg=self.BG)
-        x, y = self.bbox["left"], self.bbox["top"]
-        w, h = self.bbox["width"], self.bbox["height"]
+        # Converter bbox físico (mss) → lógico (Tkinter) para posicionar a janela
+        x = int(self.bbox["left"] / self.dpi_scale)
+        y = int(self.bbox["top"] / self.dpi_scale)
+        w = int(self.bbox["width"] / self.dpi_scale)
+        h = int(self.bbox["height"] / self.dpi_scale)
         self.top.geometry(f"{w}x{h}+{x}+{y}")
         self.top.config(cursor="cross")
         self.canvas = tk.Canvas(self.top, bg=self.BG, highlightthickness=0)
@@ -195,17 +199,23 @@ class RegionSelector:
         self.canvas.bind("<Button-1>", self._on_press)
         self.canvas.bind("<B1-Motion>", self._on_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
-        self.top.bind("<Escape>", lambda e: self._finish(None))
+        # Retorna "break" para impedir que o Escape propague para o bind_all
+        # do root, que poderia fechar o aplicativo indevidamente.
+        self.top.bind("<Escape>", lambda e: self._finish(None) or "break")
         self.top.focus_force()
         self.top.grab_set()
+
+    def _canvas_offset(self) -> tuple[int, int]:
+        """Offset do canvas em pixels lógicos (canto superior esquerdo do overlay)."""
+        return int(self.bbox["left"] / self.dpi_scale), int(self.bbox["top"] / self.dpi_scale)
 
     def _on_press(self, event) -> None:
         self._start = (event.x_root, event.y_root)
         if self._rect is not None:
             self.canvas.delete(self._rect)
-        # converter para coords do canvas (top-left = bbox.left/top)
-        cx = event.x_root - self.bbox["left"]
-        cy = event.y_root - self.bbox["top"]
+        ox, oy = self._canvas_offset()
+        cx = event.x_root - ox
+        cy = event.y_root - oy
         self._rect = self.canvas.create_rectangle(
             cx, cy, cx, cy, outline=self.LINE, width=2,
         )
@@ -213,21 +223,28 @@ class RegionSelector:
     def _on_drag(self, event) -> None:
         if self._start is None or self._rect is None:
             return
-        cx0 = self._start[0] - self.bbox["left"]
-        cy0 = self._start[1] - self.bbox["top"]
-        cx1 = event.x_root - self.bbox["left"]
-        cy1 = event.y_root - self.bbox["top"]
+        ox, oy = self._canvas_offset()
+        cx0 = self._start[0] - ox
+        cy0 = self._start[1] - oy
+        cx1 = event.x_root - ox
+        cy1 = event.y_root - oy
         self.canvas.coords(self._rect, cx0, cy0, cx1, cy1)
 
     def _on_release(self, event) -> None:
         if self._start is None:
             self._finish(None)
             return
-        x0, y0 = self._start
+        x0, y0 = self._start  # coords lógicas do Tkinter
         x1, y1 = event.x_root, event.y_root
         left, top = min(x0, x1), min(y0, y1)
         width, height = abs(x1 - x0), abs(y1 - y0)
-        region = Region(left, top, width, height)
+        # Converter pixels lógicos → físicos para que o mss capture a área correta
+        region = Region(
+            int(left * self.dpi_scale),
+            int(top * self.dpi_scale),
+            max(1, int(width * self.dpi_scale)),
+            max(1, int(height * self.dpi_scale)),
+        )
         if not region.is_valid():
             self._finish(None)
         else:

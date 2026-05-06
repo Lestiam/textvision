@@ -172,6 +172,10 @@ class TextVisionApp:
         self._describe_loading: bool = False
         self._describe_spinner_frame: int = 0
         self._describe_start_time: float = 0.0
+        self._screen_reader_active: bool = False
+        self._screen_reader_thread: threading.Thread | None = None
+        self._screen_reader_last_text: str = ""
+        self._reader_status_var: tk.StringVar | None = None
 
         # Fontes
         self.camera = CameraStream(CAMERA_INDEX)
@@ -199,6 +203,17 @@ class TextVisionApp:
 
         # Inicializa screen stream sob demanda; já popula self.screen.virtual
         self.screen.start()
+
+        # Fator de escala DPI: razão entre pixels físicos (mss) e lógicos (Tkinter).
+        # No Windows com HiDPI sem DPI-awareness, Tkinter reporta pixels lógicos
+        # enquanto o mss usa pixels físicos — sem este ajuste as coordenadas do
+        # seletor de região ficam deslocadas em relação ao que o usuário vê.
+        self._dpi_scale = 1.0
+        if len(self.screen.monitors) > 1:
+            phys_w = self.screen.monitors[1].get("width", 0)  # monitor primário físico
+            tk_w = self.root.winfo_screenwidth()               # largura lógica Tkinter
+            if tk_w > 0 and phys_w > 0:
+                self._dpi_scale = phys_w / tk_w
 
         self._refresh_lang_status()
         self.root.after(FRAME_INTERVAL_MS, self._update_frame)
@@ -745,13 +760,14 @@ class TextVisionApp:
         self._photo_size = (0, 0)  # forçar recriação do PhotoImage
         self._refresh_source_switch()
         if target == self.SOURCE_SCREEN:
-            self._set_status("Modo Tela ativado · use R para selecionar uma região")
-            # Salva geometria antes de minimizar para restaurar depois
+            self._set_status("Modo Tela · lendo em voz alta…")
             self._last_normal_geom = self.root.geometry()
             self.root.iconify()
             self.root.update_idletasks()
             self._show_screen_indicator()
+            self._start_screen_reader()
         else:
+            self._stop_screen_reader()
             self._hide_screen_indicator()
             self.root.deiconify()
             self.root.lift()
@@ -882,9 +898,13 @@ class TextVisionApp:
         # No Windows, Toplevels filhos ficam ocultos quando o owner está
         # iconic/withdrawn. Mantemos root em estado "normal" mas invisível
         # (alpha=0 + fora da tela) para que o seletor apareça corretamente.
+        # Usamos after() em vez de time.sleep() para não bloquear o event loop,
+        # garantindo que as mudanças de estado da janela sejam processadas antes
+        # de criar o RegionSelector.
         self._overlay_hide_root()
-        time.sleep(0.15)
+        self.root.after(250, self._open_region_selector)
 
+    def _open_region_selector(self) -> None:
         def done(region: Region | None) -> None:
             self._hide_screen_indicator()
             self._overlay_show_root()
@@ -897,7 +917,7 @@ class TextVisionApp:
                 self._set_status("Seleção cancelada.")
             self._photo_size = (0, 0)
 
-        sel = RegionSelector(self.root, self.screen.virtual)
+        sel = RegionSelector(self.root, self.screen.virtual, self._dpi_scale)
         sel.run(done)
 
     def _toggle_magnifier(self) -> None:
@@ -949,6 +969,7 @@ class TextVisionApp:
         if self._describe_loading:
             return
         if self.source == self.SOURCE_SCREEN:
+            self._stop_screen_reader()
             self._describe_screen_region()
         else:
             self._enter_describe_camera_mode()
@@ -992,14 +1013,17 @@ class TextVisionApp:
             except Exception:
                 pass
         self._overlay_hide_root()
-        time.sleep(0.15)
+        self.root.after(250, self._open_describe_selector)
 
+    def _open_describe_selector(self) -> None:
         def done(region: Region | None) -> None:
             self._hide_screen_indicator()
             self._overlay_show_root()
             if region and region.is_valid():
                 frame = self.screen.grab_once(region)
                 if frame is not None:
+                    # Atualiza o live view para mostrar a mesma região descrita
+                    self.screen.set_region(region)
                     self._start_describe_spinner()
                     self._set_status("Descrevendo imagem…")
                     threading.Thread(
@@ -1011,7 +1035,7 @@ class TextVisionApp:
                 self._set_status("Captura cancelada.")
             self._photo_size = (0, 0)
 
-        sel = RegionSelector(self.root, self.screen.virtual)
+        sel = RegionSelector(self.root, self.screen.virtual, self._dpi_scale)
         sel.run(done)
 
     def _describe_worker(self, frame: np.ndarray) -> None:
@@ -1032,6 +1056,8 @@ class TextVisionApp:
         self._show_ocr_text(
             result.text, meta, panel_title="DESCRIÇÃO DA IMAGEM"
         )
+        # Permite que TTS leia a descrição com L / "Ler em voz alta"
+        self.last_ocr_text = result.text
         self._set_status(f"Descrição gerada em {result.elapsed_ms:.0f} ms  (em inglês)")
 
     def _draw_describe_reticle(self, frame: np.ndarray) -> np.ndarray:
@@ -1108,6 +1134,7 @@ class TextVisionApp:
         a janela principal está minimizada no modo Tela."""
         if self._screen_indicator is not None:
             return
+        self._reader_status_var = tk.StringVar(value="Iniciando leitura…")
         ind = tk.Toplevel()
         ind.overrideredirect(True)
         ind.attributes("-topmost", True)
@@ -1116,9 +1143,6 @@ class TextVisionApp:
         except tk.TclError:
             pass
         ind.configure(bg=C_BG)
-        sw = self.root.winfo_screenwidth()
-        w, h = 232, 118
-        ind.geometry(f"{w}x{h}+{sw - w - 20}+20")
 
         outer = tk.Frame(ind, bg=C_BORDER)
         outer.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
@@ -1129,39 +1153,106 @@ class TextVisionApp:
         hdr.pack(fill=tk.X)
         tk.Label(hdr, text="TextVision", bg=C_SURFACE_HI, fg=C_TEXT,
                  font=self.f_button, padx=12, pady=8).pack(side=tk.LEFT)
-        tk.Label(hdr, text="● ATIVO", bg=C_SURFACE_HI, fg="#5cb85c",
+        tk.Label(hdr, text="● LENDO", bg=C_SURFACE_HI, fg="#5cb85c",
                  font=self.f_kbd, padx=10).pack(side=tk.RIGHT)
 
+        # Trecho do texto atualmente sendo lido
+        status_frame = tk.Frame(panel, bg=C_SURFACE)
+        status_frame.pack(fill=tk.X, padx=8, pady=(4, 2))
+        tk.Label(
+            status_frame, textvariable=self._reader_status_var,
+            bg=C_SURFACE, fg=C_TEXT_DIM, font=self.f_status,
+            anchor="w", justify=tk.LEFT, wraplength=260,
+        ).pack(fill=tk.X)
+
         btns = tk.Frame(panel, bg=C_SURFACE)
-        btns.pack(fill=tk.X, padx=8, pady=(6, 8))
+        btns.pack(fill=tk.X, padx=8, pady=(4, 8))
 
-        # Linha 1: Selecionar + Câmera
-        row1 = tk.Frame(btns, bg=C_SURFACE)
-        row1.pack(fill=tk.X, pady=(0, 4))
-        reg = tk.Label(row1, text="Selecionar  R", bg=C_ACCENT_DIM,
+        cam = tk.Label(btns, text="Câmera  S", bg=C_SURFACE_HI,
                        fg=C_TEXT, font=self.f_kbd, padx=8, pady=5, cursor="hand2")
-        reg.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
-        reg.bind("<Button-1>", lambda e: self._select_region())
-        self._hover_swap(reg, C_ACCENT_DIM, "#2a4a6e")
+        cam.pack(fill=tk.X, pady=(0, 4))
+        cam.bind("<Button-1>", lambda e: self._set_source(self.SOURCE_CAMERA))
+        self._hover_swap(cam, C_SURFACE_HI, C_BORDER)
 
-        rst = tk.Label(row1, text="Câmera  S", bg=C_SURFACE_HI,
-                       fg=C_TEXT_DIM, font=self.f_kbd, padx=8, pady=5, cursor="hand2")
-        rst.pack(side=tk.LEFT)
-        rst.bind("<Button-1>", lambda e: self._toggle_source())
-        self._hover_swap(rst, C_SURFACE_HI, C_BORDER)
-
-        # Linha 2: Descrever imagem
         desc = tk.Label(btns, text="Descrever imagem  D", bg=C_SURFACE_HI,
                         fg=C_TEXT, font=self.f_kbd, padx=8, pady=5, cursor="hand2")
         desc.pack(fill=tk.X)
         desc.bind("<Button-1>", lambda e: self._do_describe())
         self._hover_swap(desc, C_SURFACE_HI, C_BORDER)
 
-        # focus_force garante que o indicador recebe eventos de teclado
-        # (os atalhos R/S/D/etc. são tratados via bind_all no root)
+        ind.update_idletasks()
+        w = max(280, ind.winfo_reqwidth() + 4)
+        h = ind.winfo_reqheight() + 4
+        sw = self.root.winfo_screenwidth()
+        ind.geometry(f"{w}x{h}+{sw - w - 20}+20")
         ind.focus_force()
-
         self._screen_indicator = ind
+
+    # ---------- Screen reader em tempo real ----------
+
+    def _start_screen_reader(self) -> None:
+        self._stop_screen_reader()
+        self._screen_reader_active = True
+        self._screen_reader_last_text = ""
+        self._screen_reader_thread = threading.Thread(
+            target=self._screen_reader_loop, daemon=True
+        )
+        self._screen_reader_thread.start()
+
+    def _stop_screen_reader(self) -> None:
+        self._screen_reader_active = False
+        self.tts.cancel()
+        if self._screen_reader_thread is not None:
+            self._screen_reader_thread.join(timeout=2.0)
+            self._screen_reader_thread = None
+
+    def _screen_reader_loop(self) -> None:
+        """Captura a tela inteira, extrai texto (PSM 3 = ordem ocidental)
+        e fala via TTS sempre que o conteúdo muda."""
+        if not self.screen.monitors or len(self.screen.monitors) < 2:
+            return
+        mon = self.screen.monitors[1]
+        region = Region(mon["left"], mon["top"], mon["width"], mon["height"])
+
+        while self._screen_reader_active and not self._closing:
+            frame = self.screen.grab_once(region)
+            if frame is None:
+                time.sleep(0.5)
+                continue
+
+            result = self.ocr.recognize(frame, psm_preference=3)
+            if not self._screen_reader_active or self._closing:
+                break
+
+            text = result.text.strip() if result.text else ""
+            if text and text != self._screen_reader_last_text:
+                self._screen_reader_last_text = text
+                self.last_ocr_text = text
+                preview = text.replace("\n", " ")[:60]
+                if not self._closing:
+                    self.root.after(0, lambda p=preview: self._update_reader_status(p))
+                self.tts.cancel()
+                self.tts.speak(text)
+
+            # Aguarda TTS terminar antes de capturar novamente
+            waited = 0.0
+            while (self.tts.is_speaking and self._screen_reader_active
+                   and not self._closing and waited < 60.0):
+                time.sleep(0.2)
+                waited += 0.2
+
+            # Pausa curta e interrompível antes de reler
+            for _ in range(5):
+                if not self._screen_reader_active or self._closing:
+                    break
+                time.sleep(0.2)
+
+    def _update_reader_status(self, text: str) -> None:
+        if self._reader_status_var is not None:
+            try:
+                self._reader_status_var.set(text or "Aguardando texto…")
+            except tk.TclError:
+                pass
 
     def _hide_screen_indicator(self) -> None:
         if self._screen_indicator is not None:
@@ -1193,9 +1284,9 @@ class TextVisionApp:
             except Exception:
                 pass
         self.root.update_idletasks()
-        # Move para fora da área visível para não aparecer na captura de tela
-        sw = self.root.winfo_screenwidth()
-        self.root.geometry(f"+{sw + 200}+0")
+        # Move para fora da área visível — +99999 garante que está além
+        # de qualquer monitor, inclusive configurações multi-monitor.
+        self.root.geometry("+99999+0")
         self.root.update_idletasks()
 
     def _overlay_show_root(self) -> None:
@@ -1345,6 +1436,10 @@ class TextVisionApp:
             return
         self._closing = True
         try:
+            self._stop_screen_reader()
+        except Exception:
+            pass
+        try:
             self._hide_screen_indicator()
         except Exception:
             pass
@@ -1372,7 +1467,35 @@ class TextVisionApp:
 
 
 def main() -> None:
+    import sys
+    import ctypes
+
+    if sys.platform == "win32":
+        # Declara DPI-awareness antes de criar qualquer janela Tk para que
+        # as coordenadas do Tkinter (pixels físicos) coincidam com as do mss.
+        # Sem isso, em displays HiDPI o seletor de região captura a área errada.
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)  # SYSTEM_DPI_AWARE
+        except Exception:
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
+
     root = tk.Tk()
+
+    if sys.platform == "win32":
+        # Ajusta a escala de fontes do Tk para o DPI real do monitor,
+        # compensando a perda do upscaling automático do SO.
+        try:
+            hdc = ctypes.windll.user32.GetDC(0)
+            dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, 88)  # LOGPIXELSX
+            ctypes.windll.user32.ReleaseDC(0, hdc)
+            if dpi and dpi != 96:
+                root.tk.call("tk", "scaling", dpi / 72.0)
+        except Exception:
+            pass
+
     TextVisionApp(root)
     root.mainloop()
 
